@@ -7,6 +7,7 @@
 
 import struct
 import random
+import hmac
 try:
     import hashlib
     md5_constructor = hashlib.md5
@@ -60,7 +61,8 @@ class Packet(dict):
     :obj:`AuthPacket` or :obj:`AcctPacket` classes.
     """
 
-    def __init__(self, code=0, id=None, secret=six.b(''), authenticator=None, **attributes):
+    def __init__(self, code=0, id=None, secret=six.b(''), authenticator=None,
+                 auth_type='pap', **attributes):
         """Constructor
 
         :param dict:   RADIUS dictionary
@@ -85,8 +87,9 @@ class Packet(dict):
         self.secret = secret
         if authenticator is not None and \
                 not isinstance(authenticator, six.binary_type):
-            raise TypeError('authenticator must be a binary string')
+                    raise TypeError('authenticator must be a binary string')
         self.authenticator = authenticator
+        self.auth_type = auth_type
 
         if 'dict' in attributes:
             self.dict = attributes['dict']
@@ -133,8 +136,13 @@ class Packet(dict):
             return (key, values)
 
         key, _, tag = key.partition(":")
+
         attr = self.dict.attributes[key]
-        key = self._EncodeKey(key)
+        if attr.vendor:
+            key = (self.dict.vendors.GetForward(attr.vendor), attr.code)
+        else:
+            key = attr.code
+
         if tag:
             tag = struct.pack('B', int(tag))
             if attr.type == "integer":
@@ -149,7 +157,7 @@ class Packet(dict):
             return key
 
         attr = self.dict.attributes[key]
-        if attr.vendor and not attr.is_sub_attribute:  #sub attribute keys don't need vendor
+        if attr.vendor:
             return (self.dict.vendors.GetForward(attr.vendor), attr.code)
         else:
             return attr.code
@@ -170,20 +178,13 @@ class Packet(dict):
         :param value: value
         :type value:  depends on type of attribute
         """
-        attr = self.dict.attributes[key]
-
         if isinstance(value, list):
             (key, value) = self._EncodeKeyValues(key, value)
+            self.setdefault(key, []).extend(value)
         else:
             (key, value) = self._EncodeKeyValues(key, [value])
-
-        if attr.is_sub_attribute:
-            tlv = self.setdefault(self._EncodeKey(attr.parent.name), {})
-            encoded = tlv.setdefault(key, [])
-        else:
-            encoded = self.setdefault(key, [])
-
-        encoded.extend(value)
+            value = value[0]
+            self.setdefault(key, []).append(value)
 
     def __getitem__(self, key):
         if not isinstance(key, six.string_types):
@@ -191,19 +192,10 @@ class Packet(dict):
 
         values = dict.__getitem__(self, self._EncodeKey(key))
         attr = self.dict.attributes[key]
-        if attr.type == 'tlv':  # return map from sub attribute code to its values
-            res = {}
-            for (sub_attr_key, sub_attr_val) in values.items():
-                sub_attr_name = attr.sub_attributes[sub_attr_key]
-                sub_attr = self.dict.attributes[sub_attr_name]
-                for v in sub_attr_val:
-                    res.setdefault(sub_attr_name, []).append(self._DecodeValue(sub_attr, v))
-            return res
-        else:
-            res = []
-            for v in values:
-                res.append(self._DecodeValue(attr, v))
-            return res
+        res = []
+        for v in values:
+            res.append(self._DecodeValue(attr, v))
+        return res
 
     def __contains__(self, key):
         try:
@@ -463,7 +455,7 @@ class Packet(dict):
 
 class AuthPacket(Packet):
     def __init__(self, code=AccessRequest, id=None, secret=six.b(''),
-            authenticator=None, **attributes):
+            authenticator=None, auth_type='pap', **attributes):
         """Constructor
 
         :param code:   packet type code
@@ -479,7 +471,7 @@ class AuthPacket(Packet):
         :param packet: raw packet to decode
         :type packet:  string
         """
-        Packet.__init__(self, code, id, secret, authenticator, **attributes)
+        Packet.__init__(self, code, id, secret, authenticator, auth_type, **attributes)
         if 'packet' in attributes:
             self.raw_packet = attributes['packet']
 
@@ -490,7 +482,7 @@ class AuthPacket(Packet):
         """
         return AuthPacket(AccessAccept, self.id,
             self.secret, self.authenticator, dict=self.dict,
-            **attributes)
+            auth_type=self.auth_type, **attributes)
 
     def RequestPacket(self):
         """Create a ready-to-transmit authentication request packet.
@@ -507,6 +499,15 @@ class AuthPacket(Packet):
 
         if self.id is None:
             self.id = self.CreateID()
+
+        if self.auth_type == 'eap-md5':
+            header = struct.pack('!BBH16s', self.code, self.id,
+                (20 + 18 + len(attr)), self.authenticator)
+            digest = hmac.new(
+                self.secret,
+                header + attr + struct.pack('!BB16s', 80, struct.calcsize('!BB16s'), b'')
+            ).digest()
+            return header + attr + struct.pack('!BB16s', 80, struct.calcsize('!BB16s'), digest)
 
         header = struct.pack('!BBH16s', self.code, self.id,
             (20 + len(attr)), self.authenticator)
